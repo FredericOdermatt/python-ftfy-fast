@@ -285,14 +285,12 @@ def _try_fix(
     if getattr(config, fixer_name):
         fixer = FIXERS[fixer_name]
         fixed = fixer(text)
-        if steps is not None and fixed != text:
-            steps.append(ExplanationStep("apply", fixer_name))
         return cast(str, fixed)
 
     return text
 
 
-def fix_text(text: str, config: Optional[TextFixerConfig] = None, **kwargs: Any) -> str:
+def fix_text(text: str, config: Optional[TextFixerConfig] = None) -> str:
     r"""
     Given Unicode text as input, fix inconsistencies and glitches in it,
     such as mojibake (text that was decoded in the wrong encoding).
@@ -341,33 +339,18 @@ def fix_text(text: str, config: Optional[TextFixerConfig] = None, **kwargs: Any)
     To get an explanation, use the :func:`fix_and_explain()` function, which
     fixes the string in one segment and explains what it fixed.
     """
-
-    if config is None:
-        config = TextFixerConfig(explain=False)
-    config = _config_from_kwargs(config, kwargs)
     if isinstance(text, bytes):
         raise UnicodeError(BYTES_ERROR_TEXT)
 
     out = []
-    pos = 0
-    while pos < len(text):
-        textbreak = text.find("\n", pos) + 1
-        if textbreak == 0:
-            textbreak = len(text)
-        if (textbreak - pos) > config.max_decode_length:
-            textbreak = pos + config.max_decode_length
-
-        segment = text[pos:textbreak]
-        if config.unescape_html == "auto" and "<" in segment:
-            config = config._replace(unescape_html=False)
-        fixed_segment, _ = fix_and_explain(segment, config)
+    for line in text:
+        fixed_segment, _ = fix_and_explain(line, config)
         out.append(fixed_segment)
-        pos = textbreak
     return "".join(out)
 
 
 def fix_and_explain(
-    text: str, config: Optional[TextFixerConfig] = None, **kwargs: Any
+    text: str, config: Optional[TextFixerConfig] = None
 ) -> ExplainedText:
     """
     Fix text as a single segment, returning the fixed text and an explanation
@@ -380,29 +363,17 @@ def fix_and_explain(
         config = TextFixerConfig()
     if isinstance(text, bytes):
         raise UnicodeError(BYTES_ERROR_TEXT)
-    config = _config_from_kwargs(config, kwargs)
 
     if config.unescape_html == "auto" and "<" in text:
         config = config._replace(unescape_html=False)
 
-    if config.explain:
-        steps: Optional[List[ExplanationStep]] = []
-    else:
-        # If explanations aren't desired, `steps` will be None
-        steps = None
-
     while True:
         origtext = text
 
-        text = _try_fix("unescape_html", text, config, steps)
+        text = _try_fix("unescape_html", text, config)
 
         if config.fix_encoding:
-            if steps is None:
-                text = fix_encoding(text)
-            else:
-                text, encoding_steps = fix_encoding_and_explain(text, config)
-                if encoding_steps is not None:
-                    steps.extend(encoding_steps)
+            text = fix_encoding(text)
 
         for fixer in [
             "fix_c1_controls",
@@ -414,17 +385,13 @@ def fix_and_explain(
             "remove_terminal_escapes",
             "remove_control_chars",
         ]:
-            text = _try_fix(fixer, text, config, steps)
+            text = _try_fix(fixer, text, config)
 
         if config.normalization is not None:
-            fixed = unicodedata.normalize(config.normalization, text)
-            if steps is not None and fixed != text:
-                steps.append(ExplanationStep("normalize", config.normalization))
-            text = fixed
+            text = unicodedata.normalize(config.normalization, text)
 
         if text == origtext:
-            return ExplainedText(text, steps)
-
+            return text
 
 def fix_encoding_and_explain(
     text: str, config: Optional[TextFixerConfig] = None, **kwargs: Any
@@ -458,16 +425,13 @@ def fix_encoding_and_explain(
     if not config.fix_encoding:
         # A weird trivial case: we're asked to fix the encoding, but skip
         # fixing the encoding
-        return ExplainedText(text, [])
+        return text
 
-    plan_so_far: List[ExplanationStep] = []
     while True:
         prevtext = text
-        text, plan = _fix_encoding_one_step_and_explain(text, config)
-        if plan is not None:
-            plan_so_far.extend(plan)
+        text = _fix_encoding_one_step_and_explain(text, config)
         if text == prevtext:
-            return ExplainedText(text, plan_so_far)
+            return text
 
 
 def _fix_encoding_one_step_and_explain(
@@ -476,16 +440,13 @@ def _fix_encoding_one_step_and_explain(
     """
     Perform one step of fixing the encoding of text.
     """
-    if config is None:
-        config = TextFixerConfig()
 
     if len(text) == 0:
-        return ExplainedText(text, [])
-
+        return text
     # The first plan is to return ASCII text unchanged, as well as text
     # that doesn't look like it contains mojibake
     if chardata.possible_encoding(text, "ascii") or not is_bad(text):
-        return ExplainedText(text, [])
+        return text
 
     # As we go through the next step, remember the possible encodings
     # that we encounter but don't successfully fix yet. We may need them
@@ -499,8 +460,6 @@ def _fix_encoding_one_step_and_explain(
         if chardata.possible_encoding(text, encoding):
             possible_1byte_encodings.append(encoding)
             encoded_bytes = text.encode(encoding)
-            encode_step = ExplanationStep("encode", encoding)
-            transcode_steps = []
 
             # Now, find out if it's UTF-8 (or close enough). Otherwise,
             # remember the encoding for later.
@@ -518,37 +477,28 @@ def _fix_encoding_one_step_and_explain(
                 ):
                     replaced_bytes = fixes.restore_byte_a0(encoded_bytes)
                     if replaced_bytes != encoded_bytes:
-                        transcode_steps.append(
-                            ExplanationStep("transcode", "restore_byte_a0")
-                        )
                         encoded_bytes = replaced_bytes
 
                 # Replace sequences where information has been lost
                 if config.replace_lossy_sequences and encoding.startswith("sloppy"):
                     replaced_bytes = fixes.replace_lossy_sequences(encoded_bytes)
                     if replaced_bytes != encoded_bytes:
-                        transcode_steps.append(
-                            ExplanationStep("transcode", "replace_lossy_sequences")
-                        )
                         encoded_bytes = replaced_bytes
 
                 if 0xED in encoded_bytes or 0xC0 in encoded_bytes:
                     decoding = "utf-8-variants"
 
-                decode_step = ExplanationStep("decode", decoding)
-                steps = [encode_step] + transcode_steps + [decode_step]
                 fixed = encoded_bytes.decode(decoding)
-                return ExplainedText(fixed, steps)
+                return fixed
 
             except UnicodeDecodeError:
                 pass
 
     # Look for a-hat-euro sequences that remain, and fix them in isolation.
     if config.decode_inconsistent_utf8 and chardata.UTF8_DETECTOR_RE.search(text):
-        steps = [ExplanationStep("apply", "decode_inconsistent_utf8")]
         fixed = fixes.decode_inconsistent_utf8(text)
         if fixed != text:
-            return ExplainedText(fixed, steps)
+            return fixed
 
     # The next most likely case is that this is Latin-1 that was intended to
     # be read as Windows-1252, because those two encodings in particular are
@@ -557,7 +507,7 @@ def _fix_encoding_one_step_and_explain(
         if "windows-1252" in possible_1byte_encodings:
             # This text is in the intersection of Latin-1 and
             # Windows-1252, so it's probably legit.
-            return ExplainedText(text, [])
+            return text
         else:
             # Otherwise, it means we have characters that are in Latin-1 but
             # not in Windows-1252. Those are C1 control characters. Nobody
@@ -565,19 +515,14 @@ def _fix_encoding_one_step_and_explain(
             try:
                 fixed = text.encode("latin-1").decode("windows-1252")
                 if fixed != text:
-                    steps = [
-                        ExplanationStep("encode", "latin-1"),
-                        ExplanationStep("decode", "windows-1252"),
-                    ]
-                    return ExplainedText(fixed, steps)
+                    return fixed
             except UnicodeDecodeError:
                 pass
 
     # Fix individual characters of Latin-1 with a less satisfying explanation
     if config.fix_c1_controls and chardata.C1_CONTROL_RE.search(text):
-        steps = [ExplanationStep("transcode", "fix_c1_controls")]
         fixed = fixes.fix_c1_controls(text)
-        return ExplainedText(fixed, steps)
+        return fixed
 
     # The cases that remain are mixups between two different single-byte
     # encodings, and not the common case of Latin-1 vs. Windows-1252.
@@ -585,7 +530,7 @@ def _fix_encoding_one_step_and_explain(
     # With the new heuristic in 6.0, it's possible that we're closer to solving
     # these in some cases. It would require a lot of testing and tuning, though.
     # For now, we leave the text unchanged in these cases.
-    return ExplainedText(text, [])
+    return text
 
 
 def fix_encoding(
@@ -603,7 +548,7 @@ def fix_encoding(
     if config is None:
         config = TextFixerConfig(explain=False)
     config = _config_from_kwargs(config, kwargs)
-    fixed, _explan = fix_encoding_and_explain(text, config)
+    fixed = fix_encoding_and_explain(text, config)
     return fixed
 
 
